@@ -21,7 +21,15 @@ Planned Features
 
 I might also add mouse support for the G500 as it has programmable keys as well for macros,
 tho this is just a planned addition.
+==============================================================================================
+Building Instructions
+==============================================================================================
+To build Logitools, you must first build and install the projects in the following order:
+1. liblogitech
+2. liblogitechrender
+3. logitoolsd
 
+liblogitechcpp and anything in logitoolsd-clients can then be built afterwards
 ==============================================================================================
 NOTE: The Attic just contains code I have not converted to CMake or renamed things or added
       new code. Mostly anything here will not build at all.
