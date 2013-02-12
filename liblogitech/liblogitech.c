@@ -402,8 +402,11 @@ int handle_usb_errors(const char *prefix, int ret) {
             break;
         case LIBUSB_ERROR_OVERFLOW:
             case -ENOSPC: /* the we dont have enough bandwidth, apparently.. something has to give here.. */
-                g15_log(stderr,G15_LOG_INFO,"usb error: ENOSPC.. reducing speed\n");
-                enospc_slowdown = 1;
+            	if (strcmp(prefix, "Keyboard Read")) {	/* Should only try to do this if it's the LCD */
+            		/* Of course, the bigger question is what do we do about the overflow from the keyboard? */
+            		g15_log(stderr,G15_LOG_INFO,"usb error: %s overflow (%d)... reducing speed\n", prefix, ret);
+            		enospc_slowdown = 1;
+            	}
                 break;
             case LIBUSB_ERROR_NO_DEVICE:
             case -ENODEV: /* the device went away - we probably should attempt to reattach */
