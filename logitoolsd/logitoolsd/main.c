@@ -50,7 +50,9 @@ unsigned int cycle_key;
 unsigned int client_handles_keys = 0;
 static unsigned int set_backlight = 0;
 struct lcd_t *keyhandler = NULL;
-
+static uid_t	nobody_uid = -1;
+static gid_t	nobody_gid = -1;
+unsigned char user[256];
 static int loaded_plugins = 0;
 
 /* send event to foreground client's eventlistener */
@@ -207,10 +209,22 @@ static void *keyboard_watch_thread(void *lcdlist){
 
         }else if(retval == -ENODEV && LIBG15_VERSION>=1200) {
           pthread_mutex_lock(&g15lib_mutex);
+#ifndef OSTYPE_SOLARIS
+          if (seteuid(getuid()) != 0)
+    		  g15daemon_log(LOG_WARNING, "Unable to reset user id to original id %d\n", getuid());
+          if (setegid(getgid()) != 0)
+    		  g15daemon_log(LOG_WARNING, "Unable to reset group id to original id %d\n", getgid());
+#endif
           while((retval=re_initLibG15() != G15_NO_ERROR) && !leaving){
-             g15daemon_log(LOG_WARNING,"Keyboard has gone.. Retrying\n");
+        	 g15daemon_log(LOG_WARNING,"Keyboard has gone.. Retrying\n");
              sleep(1);
           }
+#ifndef OSTYPE_SOLARIS
+       	  if (setegid(nobody_gid) != 0)
+       		  g15daemon_log(LOG_WARNING, "Unable to reset group id for %s(%d)\n", user, nobody_gid);
+       	  if (seteuid(nobody_uid) != 0)
+       		  g15daemon_log(LOG_WARNING, "Unable to reset user id to %s(%d)\n", user, nobody_uid);
+#endif
           if(!leaving) { 
             masterlist->current->lcd->state_changed=1; 
             g15daemon_send_refresh(masterlist->current->lcd);
@@ -328,9 +342,9 @@ int main (int argc, char *argv[])
     int cycle_cmdline_override=0;
     struct sigaction new_action;
     cycle_key = G15_KEY_L1;
-    unsigned char user[256];
     unsigned int lcdlevel = 1;
     
+    user[0] = 0;
     pthread_t keyboard_thread;
     pthread_t lcd_thread;
     memset(user,0,256); 
@@ -440,17 +454,18 @@ int main (int argc, char *argv[])
      }
 #endif
 
-    /* init stuff here..  */
-    if((retval=initLibG15())!=G15_NO_ERROR){
-        g15daemon_log(LOG_ERR,"Unable to attach to the G15 Keyboard... exiting");
-        exit(1);
-    }
-
     if(!g15daemon_debug)
         daemon(0,0);
 
     if(uf_create_pidfile() == 0) {
         
+        /* init stuff here..  */
+        if((retval=initLibG15())!=G15_NO_ERROR){
+            g15daemon_log(LOG_ERR,"Unable to attach to the G15 Keyboard... exiting");
+            unlink("/var/run/logitoolsd.pid");
+            exit(1);
+        }
+
         g15daemon_t *lcdlist;
         config_section_t *global_cfg=NULL;
         pthread_attr_t attr;
@@ -459,6 +474,7 @@ int main (int argc, char *argv[])
 
         openlog("g15daemon", LOG_PID, LOG_USER);
         if(strlen((char*)user)==0){
+        	(void) strcpy((char *) user, "nobody");
             nobody = getpwnam("nobody");
         }else {
             nobody = getpwnam((char*)user);
@@ -466,6 +482,7 @@ int main (int argc, char *argv[])
         if (nobody==NULL)
         {
             nobody = getpwuid(geteuid());
+            (void) strcpy((char *) user, nobody->pw_name);
             g15daemon_log(LOG_WARNING,"BEWARE: running as effective uid %i\n",nobody->pw_uid);
         }
         
@@ -494,6 +511,8 @@ int main (int argc, char *argv[])
 #ifndef OSTYPE_SOLARIS
                /* all other processes/threads should be seteuid nobody */
         if(nobody!=NULL) {
+        	nobody_uid = nobody->pw_uid;
+        	nobody_gid = nobody->pw_gid;
             seteuid(nobody->pw_uid);
             setegid(nobody->pw_gid);
         }
@@ -560,6 +579,7 @@ int main (int argc, char *argv[])
 #endif
 #endif
             
+exitnow:
 #ifdef LIBG15_VERSION
 #if LIBG15_VERSION >= 1100
         exitLibG15(); 
@@ -567,7 +587,6 @@ int main (int argc, char *argv[])
 #endif
         ll_lcdlist_destroy(&lcdlist);
 
-exitnow:
     /* return to root privilages for the final countdown */
     seteuid(0);
     setegid(0);

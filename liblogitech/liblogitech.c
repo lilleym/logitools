@@ -21,12 +21,14 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "liblogitech.h"
 #include <stdio.h>
 #include <stdarg.h>
-#include <usb.h>
+#include <libusb-1.0/libusb.h>
 #include <string.h>
 #include <errno.h>
 #include "config.h"
 
-static usb_dev_handle *keyboard_device = 0;
+static libusb_context *context = NULL;
+static libusb_device_handle *keyboard_device = NULL;
+static int open_interface = -1;
 static int libg15_debugging_enabled = 0;
 static int enospc_slowdown = 0;
 
@@ -64,7 +66,6 @@ int g15DeviceCapabilities() {
 void libg15Debug(int option) {
 
     libg15_debugging_enabled = option;
-    usb_set_debug(option);
 }
 
 /* debugging wrapper */
@@ -83,19 +84,26 @@ static int g15_log (FILE *fd, unsigned int level, const char *fmt, ...) {
 
 /* return number of connected and supported devices */
 int g15NumberOfConnectedDevices() {
-    struct usb_bus *bus = 0;
-    struct usb_device *dev = 0;
-    int i=0;
+	libusb_device **devices;
+	struct libusb_device_descriptor desc;
+	ssize_t count;
+	int i, j;
     unsigned int found = 0;
 
-    for (i=0; g15_devices[i].name !=NULL;i++)
-        for (bus = usb_busses; bus; bus = bus->next)
-    {
-        for (dev = bus->devices; dev; dev = dev->next)
-        {
-            if ((dev->descriptor.idVendor == g15_devices[i].vendorid && dev->descriptor.idProduct == g15_devices[i].productid))
-                found++;
-        }
+    if (context) {	/* Ensure we're initialized. */
+    	count = libusb_get_device_list(context, &devices);
+    	for (i = 0; i < count; i++) {
+    		if (!libusb_get_device_descriptor(devices[i], &desc)) {
+    			/* Only check device if we successfully returned its descriptor. */
+    			for (j = 0; g15_devices[j].name != NULL; j++) {
+    				if ((desc.idVendor == g15_devices[j].vendorid) &&
+    					(desc.idProduct == g15_devices[j].productid)) {
+    					found++;
+    				}
+    			}
+    		}
+    	}
+    	libusb_free_device_list(devices, 1);	/* De-reference the entire list. */
     }
     g15_log(stderr,G15_LOG_INFO,"Found %i supported devices\n",found);
     return found;
@@ -103,171 +111,142 @@ int g15NumberOfConnectedDevices() {
 
 static int initLibUsb()
 {
-    usb_init();
+	int	ret;
 
-  /**
-     *  usb_find_busses and usb_find_devices both report the number of devices
-     *  / busses added / removed since the last call. since this is the first
-   *  call we have to return values != 0 or else we didnt find anything */
-
-    if (!usb_find_busses())
-        return G15_ERROR_OPENING_USB_DEVICE;
-
-    if (!usb_find_devices())
-        return G15_ERROR_OPENING_USB_DEVICE;
-
-    return G15_NO_ERROR;
+	// TODO : OK to init twice???
+    ret = libusb_init(&context);
+    if (ret == 0) {
+    	libusb_set_debug(context, libg15_debugging_enabled);
+    }
+    return	ret;
 }
 
-static usb_dev_handle * findAndOpenDevice(libg15_devices_t handled_device, int device_index)
+/* Convenience function to correctly cleanup open device list. */
+static libusb_device_handle *findCleanup(libusb_device_handle *handle, libusb_device **devices) {
+	if (handle)
+		libusb_close(handle);
+	libusb_free_device_list(devices, 1);	/* De-reference entire list. */
+	return	NULL;
+}
+
+static libusb_device_handle * findAndOpenDevice(libg15_devices_t handled_device, int device_index)
 {
-    struct usb_bus *bus = 0;
-    struct usb_device *dev = 0;
-    int retries=0;
-    int j,i,k,l;
-    int interface=0;
+	libusb_device **devices;
+	libusb_device_handle *handle = NULL;
+	struct libusb_device_descriptor desc;
+	struct libusb_config_descriptor *cfg;
+	const struct libusb_interface *interface;
+	const struct libusb_interface_descriptor *if_desc;
+	ssize_t count;
+	int i, j, k, l, m, ret, retries;
+	unsigned int found = 0;
 
-    for (bus = usb_busses; bus; bus = bus->next)
-    {
-        for (dev = bus->devices; dev; dev = dev->next)
-        {
-            if ((dev->descriptor.idVendor == handled_device.vendorid && dev->descriptor.idProduct == handled_device.productid))
-            {
-                int ret=0;
-                char name_buffer[65535];
-                name_buffer[0] = 0;
-                usb_dev_handle *devh = 0;
-                found_devicetype = device_index;
-                g15_log(stderr,G15_LOG_INFO,"Found %s, trying to open it\n",handled_device.name);
-#if 0
-                devh = usb_open(dev);
-                usb_reset(devh);
-                usleep(50*1000);
-                usb_close(devh);
-#endif
-                devh = usb_open(dev);
-                if (!devh)
-                {
-                    g15_log(stderr,G15_LOG_INFO, "Error, could not open the keyboard\n");
-                    g15_log(stderr,G15_LOG_INFO, "Perhaps you dont have enough permissions to access it\n");
-                    return 0;
-                }
+	if (!context)	/* Ensure we're initialized. */
+		return	NULL;
+	count = libusb_get_device_list(context, &devices);
+	for (i = 0; i < count; i++) {
+		if (!libusb_get_device_descriptor(devices[i], &desc)) {
+			/* Only check device if we successfully returned its descriptor. */
+			if ((desc.idVendor == handled_device.vendorid) && (desc.idProduct == handled_device.productid)) {
+				found_devicetype = device_index;
+				g15_log(stderr, G15_LOG_INFO, "Found %s, trying to open it\n", handled_device.name);
+				ret = libusb_open(devices[i], &handle);
+				if (ret != 0) {
+					g15_log(stderr, G15_LOG_INFO, "Error %d, could not open keyboard\nPerhaps you don't have the appropriate permissions\n", ret);
+					return	NULL;
+				}
+				usleep(50 * 1000);
+				g15_log(stderr, G15_LOG_INFO, "Device has %i possible configurations\n", desc.bNumConfigurations);
 
-                usleep(50*1000);
-
-                g15_log(stderr, G15_LOG_INFO, "Device has %i possible configurations\n",dev->descriptor.bNumConfigurations);
-
-                /* if device is shared with another driver, such as the Z-10 speakers sharing with alsa, we have to disable some calls */
+				/* if device is shared with another driver, such as the Z-10 speakers sharing with alsa, we have to disable some calls */
                 if(g15DeviceCapabilities() & G15_DEVICE_IS_SHARED)
                   shared_device = 1;
+                for (j = 0; j < desc.bNumConfigurations; j++) {
+                	ret = libusb_get_config_descriptor(devices[i], j, &cfg);
+                	if (ret != 0) {
+                		g15_log(stderr, G15_LOG_INFO, "Error %d, could not get config descriptor", ret);
+                		continue;	/* NOT break */
+                	}
+                	for (k = 0; k < cfg->bNumInterfaces; k++) {
+                		if (g15DeviceCapabilities() & G15_DEVICE_G510) {
+                			if (k == G510_STANDARD_KEYBOARD_INTERFACE)
+                				continue;	/* NOT break */
+                		}
+                		if ((g15_keys_endpoint != 0) && (g15_lcd_endpoint != 0)) {
+                			break;	/* We're done, so finish up. */
+                		}
+                		interface = &(cfg->interface[k]);
+                		g15_log(stderr, G15_LOG_INFO, "Device has %i Alternate Settings\n", interface->num_altsetting);
+                		for (l = 0; l < interface->num_altsetting; l++) {
+                			if_desc = &(interface->altsetting[l]);
 
-                for (j = 0; j<dev->descriptor.bNumConfigurations;j++){
-                    struct usb_config_descriptor *cfg = &dev->config[j];
+                			/* Verify the interface is for a HID device */
+                			if (if_desc->bInterfaceClass == LIBUSB_CLASS_HID) {
+                				g15_log(stderr, G15_LOG_INFO, "Interface %i has %i Endpoints\n", i, if_desc->bNumEndpoints);
+                				usleep(50 * 1000);
 
-                    for (i=0;i<cfg->bNumInterfaces; i++){
-                        if (g15DeviceCapabilities()&G15_DEVICE_G510){
-                            if (i==G510_STANDARD_KEYBOARD_INTERFACE) continue;
-                        }
-
-                        struct usb_interface *ifp = &cfg->interface[i];
-                        /* if endpoints are already known, finish up */
-                        if(g15_keys_endpoint && g15_lcd_endpoint)
-                          break;
-                        g15_log(stderr, G15_LOG_INFO, "Device has %i Alternate Settings\n", ifp->num_altsetting);
-
-                        for(k=0;k<ifp->num_altsetting;k++){
-                            struct usb_interface_descriptor *as = &ifp->altsetting[k];
-                            /* verify that the interface is for a HID device */
-                            if(as->bInterfaceClass==USB_CLASS_HID){
-                                g15_log(stderr, G15_LOG_INFO, "Interface %i has %i Endpoints\n", i, as->bNumEndpoints);
-                                usleep(50*1000);
-        			/* libusb functions ending in _np are not portable between OS's
-                                * Non-linux users will need some way to detach the HID driver from
-                                * the G15 until we work out how to do this for other OS's automatically.
-                                * For the moment, we just skip this code..
-                                */
-#ifdef LIBUSB_HAS_GET_DRIVER_NP
-                                ret = usb_get_driver_np(devh, i, name_buffer, 65535);
-        			/* some kernel versions say that a driver is attached even though there is none
-                                in this case the name buffer has not been changed
-                                thanks to RobEngle for pointing this out */
-                                if (!ret && name_buffer[0])
-                                {
-                                    g15_log(stderr,G15_LOG_INFO,"Trying to detach driver currently attached: \"%s\"\n",name_buffer);
-
-                                    ret = usb_detach_kernel_driver_np(devh, i);
-                                    if (!ret)
-                                    {
-                                        g15_log(stderr,G15_LOG_INFO,"Success, detached the driver\n");
-                                    }
-                                    else
-                                    {
-                                        g15_log(stderr,G15_LOG_INFO,"Sorry, I could not detach the driver, giving up\n");
-                                        return 0;
-                                    }
-
-                                }
-#endif
-                                /* don't set configuration if device is shared */
+                				ret = libusb_kernel_driver_active(handle, k);
+                				if (ret == 1) {	/* This is the only case where the kernel driver is actually active. */
+                					open_interface = k;
+                					ret = libusb_detach_kernel_driver(handle, k);
+                					if (!ret) {
+                						g15_log(stderr, G15_LOG_INFO, "Success, detached the driver\n");
+                					} else {
+                						g15_log(stderr, G15_LOG_INFO, "Sorry, couldn't detach the driver, error %d\n", ret);
+                						return	findCleanup(handle, devices);
+                					}
+                				}
+   								/* don't set configuration if device is shared */
                                 if(0 == shared_device) {
-                                  ret = usb_set_configuration(devh, 1);
-                                  if (ret)
-                                  {
-                                    g15_log(stderr,G15_LOG_INFO,"Error setting the configuration, this is fatal\n");
-                                    return 0;
-                                  }
+                                  	ret = libusb_set_configuration(handle, 1);
+                                   	if (ret != 0) {
+                                   		g15_log(stderr, G15_LOG_INFO, "Unable to set configuration, error %d\n", ret);
+                                   		return	findCleanup(handle, devices);
+                                   	}
                                 }
                                 usleep(50*1000);
-                                while((ret = usb_claim_interface(devh,i)) && retries <10) {
-                                    usleep(50*1000);
+                                g15_log(stderr, G15_LOG_INFO, "Trying to claim interface %d\n", k);
+                                while ((ret = libusb_claim_interface(handle, k)) && (retries < 10)) {
+                                	usleep(50*1000);
                                     retries++;
-                                    g15_log(stderr,G15_LOG_INFO,"Trying to claim interface\n");
+                                    g15_log(stderr, G15_LOG_INFO, "Trying to claim interface %d, retry %d\n", k, retries);
                                 }
-
-                                if (ret)
-                                {
-                                    g15_log(stderr,G15_LOG_INFO,"Error claiming interface, good day cruel world\n");
-                                    return 0;
+                                if (ret) {
+                                   	g15_log(stderr, G15_LOG_INFO, "Error claiming interface, code %d\n", ret);
+                                   	return	findCleanup(handle, devices);
                                 }
+                                for (m = 0; m < if_desc->bNumEndpoints; m++) {
+                                   	const struct libusb_endpoint_descriptor *end = &(if_desc->endpoint[m]);
 
-                                for (l=0; l< as->bNumEndpoints;l++){
-                                    struct usb_endpoint_descriptor *ep=&as->endpoint[l];
-                                    g15_log(stderr, G15_LOG_INFO, "Found %s endpoint %i with address 0x%X maxtransfersize=%i \n",
-                                            0x80&ep->bEndpointAddress?"\"Extra Keys\"":"\"LCD\"",
-                                            ep->bEndpointAddress&0x0f,ep->bEndpointAddress, ep->wMaxPacketSize
-                                           );
-
-                                    if(0x80 & ep->bEndpointAddress) {
-                                        g15_keys_endpoint = ep->bEndpointAddress;
-                                    } else {
-                                        g15_lcd_endpoint = ep->bEndpointAddress;
-                                    }
-#if 0
-                                    usb_resetep(devh,ep->bEndpointAddress);
-#endif
+                                   	g15_log(stderr, G15_LOG_INFO, "Found %s endpoint %i with address 0x%X maxtransfersize=%i\n",
+                                   			((0x80 & end->bEndpointAddress) ? "\"Extra Keys\"" : "\"LCD\""),
+                                   			end->bEndpointAddress & 0x0f, end->bEndpointAddress, end->wMaxPacketSize);
+                                   	if (0x80 & end->bEndpointAddress) {
+                                   		g15_keys_endpoint = end->bEndpointAddress;
+                                   	} else {
+                                   		g15_lcd_endpoint = end->bEndpointAddress;
+                                   	}
                                 }
-
-                                if (ret)
-                                {
-                                    g15_log(stderr, G15_LOG_INFO, "Error setting Alternate Interface\n");
-                                }
-                            }
-                        }
-                    }
+                                if (ret) {
+                                   	g15_log(stderr, G15_LOG_INFO, "Error %d setting Alternative Interface\n", ret);
+                				}
+                			}
+                		}
+                	}
                 }
-
-
-                g15_log(stderr,G15_LOG_INFO,"Done opening the keyboard\n");
-                usleep(500*1000); // sleep a bit for good measure
-                return devh;
-            }
-        }
-    }
-    return 0;
+           	g15_log(stderr, G15_LOG_INFO, "Done opening the keyboard\n");
+           	usleep(50 * 1000);
+           	libusb_free_device_list(devices, 1);	/* De-reference all entries, opened device still has 1 ref */
+           	return	handle;
+			}
+		}
+	}
+	libusb_free_device_list(devices, 1);	/* De-reference all entries. */
+	return	0;
 }
 
 
-static usb_dev_handle * findAndOpenG15() {
+static libusb_device_handle * findAndOpenG15() {
     int i;
     for (i=0; g15_devices[i].name !=NULL  ;i++){
         g15_log(stderr,G15_LOG_INFO,"Trying to find %s\n",g15_devices[i].name);
@@ -283,22 +262,7 @@ static usb_dev_handle * findAndOpenG15() {
 
 int re_initLibG15()
 {
-
-    usb_init();
-
-  /**
-     *  usb_find_busses and usb_find_devices both report the number of devices
-     *  / busses added / removed since the last call. since this is the first
-   *  call we have to return values != 0 or else we didnt find anything */
-
-    if (!usb_find_devices())
-        return G15_ERROR_OPENING_USB_DEVICE;
-
-    keyboard_device = findAndOpenG15();
-    if (!keyboard_device)
-        return G15_ERROR_OPENING_USB_DEVICE;
-
-    return G15_NO_ERROR;
+	return	initLibG15();
 }
 
 int initLibG15()
@@ -330,14 +294,18 @@ int exitLibG15()
     int retval = G15_NO_ERROR;
     if (keyboard_device){
 #ifndef SUN_LIBUSB
-        retval = usb_release_interface (keyboard_device, 0);
+        retval = libusb_release_interface (keyboard_device, open_interface);
         usleep(50*1000);
 #endif
 #if 0
         retval = usb_reset(keyboard_device);
         usleep(50*1000);
 #endif
-        usb_close(keyboard_device);
+        retval = libusb_attach_kernel_driver(keyboard_device, open_interface);
+        if (retval != 0) {
+        	g15_log(stderr, G15_LOG_INFO, "Unable to re-attach kernel driver, error %d\n", retval);
+        }
+        libusb_close(keyboard_device);
         keyboard_device=0;
         pthread_mutex_destroy(&libusb_mutex);
         return retval;
@@ -425,31 +393,64 @@ static void dumpPixmapIntoLCDFormat(unsigned char *lcd_buffer, unsigned char con
 }
 
 int handle_usb_errors(const char *prefix, int ret) {
+	libusb_device_handle *tmp = NULL;
+	int	retval;
 
     switch (ret){
         case -ETIMEDOUT:
+        case LIBUSB_ERROR_TIMEOUT:
             return G15_ERROR_READING_USB_DEVICE;  /* backward-compatibility */
             break;
+        case LIBUSB_ERROR_OVERFLOW:
             case -ENOSPC: /* the we dont have enough bandwidth, apparently.. something has to give here.. */
-                g15_log(stderr,G15_LOG_INFO,"usb error: ENOSPC.. reducing speed\n");
-                enospc_slowdown = 1;
+            	if (strcmp(prefix, "Keyboard Read")) {	/* Should only try to do this if it's the LCD */
+            		/* Of course, the bigger question is what do we do about the overflow from the keyboard? */
+            		g15_log(stderr,G15_LOG_INFO,"usb error: %s overflow (%d)... reducing speed\n", prefix, ret);
+            		enospc_slowdown = 1;
+            	}
                 break;
+            case LIBUSB_ERROR_NO_DEVICE:
             case -ENODEV: /* the device went away - we probably should attempt to reattach */
+                g15_log(stderr,G15_LOG_INFO,"usb error: %s %s (%i) - attempting to re-connect...\n", prefix, libusb_error_name(ret), ret);
+                retval = libusb_reset_device(keyboard_device);
+                switch (retval) {
+                case LIBUSB_ERROR_NOT_FOUND :
+                    g15_log(stderr,G15_LOG_INFO,"Unable to reconnect, usb error: %s %s (%i)\n", prefix, libusb_error_name(retval), retval);
+#ifndef SUN_LIBUSB
+                    libusb_release_interface (keyboard_device, open_interface);
+                    usleep(50*1000);
+#endif
+                    libusb_close(keyboard_device);
+                    keyboard_device = NULL;
+                    g15_lcd_endpoint = 0;
+                    g15_keys_endpoint = 0;
+                    return	-ENODEV;	// For compatibility with previous versions.
+                	break;
+                case 0:
+                	g15_log(stderr, G15_LOG_INFO, "Reconnect successful\n");
+                	break;
+                default:
+                	handle_usb_errors(prefix, retval);
+                	break;
+                }
+            	break;
             case -ENXIO: /* host controller bug */
             case -EINVAL: /* invalid request */
             case -EAGAIN: /* try again */
             case -EFBIG: /* too many frames to handle */
             case -EMSGSIZE: /* msgsize is invalid */
-                 g15_log(stderr,G15_LOG_INFO,"usb error: %s %s (%i)\n",prefix,usb_strerror(),ret);
+                 g15_log(stderr,G15_LOG_INFO,"usb error: %s %s (%i)\n", prefix, libusb_error_name(ret), ret);
                  break;
             case -EPIPE: /* endpoint is stalled */
+            case LIBUSB_ERROR_PIPE:
                  g15_log(stderr,G15_LOG_INFO,"usb error: %s EPIPE! clearing...\n",prefix);
                  pthread_mutex_lock(&libusb_mutex);
-                 usb_clear_halt(keyboard_device, 0x81);
+                 libusb_clear_halt(keyboard_device, 0x81);
                  pthread_mutex_unlock(&libusb_mutex);
                  break;
             default: /* timed out */
-                 g15_log(stderr,G15_LOG_INFO,"Unknown usb error: %s !! (err is %i (%s))\n",prefix,ret,usb_strerror());
+                 g15_log(stderr,G15_LOG_INFO,"Unknown usb error: %s !! (err is %i (%s))\n",prefix,ret, libusb_error_name(ret));
+                 break;
     }
     return ret;
 }
@@ -457,6 +458,7 @@ int handle_usb_errors(const char *prefix, int ret) {
 int writePixmapToLCD(unsigned char const *data)
 {
     int ret = 0;
+    int written = 0;
     int transfercount=0;
     unsigned char lcd_buffer[G15_BUFFER_LEN];
     /* The pixmap conversion function will overwrite everything after G15_LCD_OFFSET, so we only need to blank
@@ -480,8 +482,9 @@ int writePixmapToLCD(unsigned char const *data)
         pthread_mutex_lock(&libusb_mutex);
 #endif
         for(transfercount = 0;transfercount<=31;transfercount++){
-            ret = usb_interrupt_write(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer+(32*transfercount), 32, 1000);
-            if (ret != 32)
+        	// TODO : Check buffer lengths and transfer amounts???
+            ret = libusb_interrupt_transfer(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer+(32*transfercount), 32, &written, 1000);
+            if (written != 32)
             {
                 handle_usb_errors ("LCDPixmap Slow Write",ret);
                 return G15_ERROR_WRITING_PIXMAP;
@@ -494,13 +497,13 @@ int writePixmapToLCD(unsigned char const *data)
     }else{
         /* transfer entire buffer in one hit */
 #ifdef LIBUSB_BLOCKS
-        ret = usb_interrupt_write(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer, G15_BUFFER_LEN, 1000);
+        ret = libusb_interrupt_transfer(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer, G15_BUFFER_LEN, &written, 1000);
 #else
         pthread_mutex_lock(&libusb_mutex);
-        ret = usb_interrupt_write(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer, G15_BUFFER_LEN, 1000);
+        ret = libusb_interrupt_transfer(keyboard_device, g15_lcd_endpoint, (char*)lcd_buffer, G15_BUFFER_LEN, &written, 1000);
         pthread_mutex_unlock(&libusb_mutex);
 #endif
-        if (ret != G15_BUFFER_LEN)
+        if (written != G15_BUFFER_LEN)
         {
             handle_usb_errors ("LCDPixmap Write",ret);
             return G15_ERROR_WRITING_PIXMAP;
@@ -531,7 +534,7 @@ int setLCDContrast(unsigned int level)
             usb_data[3] = 18;
     }
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -562,7 +565,7 @@ int setLEDs(unsigned int leds)
         return G15_ERROR_UNSUPPORTED;
 
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, cmd_code, 0, (char*)m_led_buf, cmd_size, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, cmd_code, 0, (char*)m_led_buf, cmd_size, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -587,7 +590,7 @@ int setLCDBrightness(unsigned int level)
             usb_data[2] = 0x00;
     }
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -613,7 +616,7 @@ int setKBBrightness(unsigned int level)
             usb_data[2] = 0x0;
     }
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, 0x302, 0, (char*)usb_data, 4, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -628,7 +631,7 @@ int setG510LEDColor(unsigned char r, unsigned char g, unsigned char b)
     usb_data[3] = b;
 
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x305, 1, (char*)usb_data, 4, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, 0x305, 1, (char*)usb_data, 4, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -647,7 +650,7 @@ int setG110LEDColor(unsigned char color, unsigned char brightness)
     usb_data[4] = brightness;
 
     pthread_mutex_lock(&libusb_mutex);
-    retval = usb_control_msg(keyboard_device, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x307, 0, (char*)usb_data, 5, 10000);
+    retval = libusb_control_transfer(keyboard_device, LIBUSB_REQUEST_TYPE_CLASS + LIBUSB_RECIPIENT_INTERFACE, 9, 0x307, 0, (char*)usb_data, 5, 10000);
     pthread_mutex_unlock(&libusb_mutex);
     return retval;
 }
@@ -1061,31 +1064,35 @@ static void processKeyEvent4Byte(unsigned int *pressed_keys, unsigned char *buff
 	}
 }
 
+// TODO : Convert this to using uint_fast64_t * for pressed_keys to support additional keys.
+
 int getPressedKeys(unsigned int *pressed_keys, unsigned int timeout)
 {
     unsigned char buffer[G15_KEY_READ_LENGTH];
     int ret = 0;
     int caps = 0;
+    int	read = 0;
 
 #ifdef LIBUSB_BLOCKS
-    ret = usb_interrupt_read(keyboard_device, g15_keys_endpoint, (char*)buffer, G15_KEY_READ_LENGTH, timeout);
+    ret = libusb_interrupt_transfer(keyboard_device, g15_keys_endpoint, (char*)buffer, G15_KEY_READ_LENGTH, &read, timeout);
 #else
     pthread_mutex_lock(&libusb_mutex);
-    ret = usb_interrupt_read(keyboard_device, g15_keys_endpoint, (char*)buffer, G15_KEY_READ_LENGTH, timeout);
+    ret = libusb_interrupt_transfer(keyboard_device, g15_keys_endpoint, (char*)buffer, G15_KEY_READ_LENGTH, &read, timeout);
     pthread_mutex_unlock(&libusb_mutex);
 #endif
-    if(ret>0) {
-      if(buffer[0] == 1)
-        return G15_ERROR_TRY_AGAIN;
-    }
+    if (ret != 0)
+    	return	handle_usb_errors("Keyboard Read", ret);
+    if (read > 0) {
+    	if(buffer[0] == 1)
+    		return G15_ERROR_TRY_AGAIN;
 
-    caps = g15DeviceCapabilities();
-    if((caps & G15_DEVICE_G13) && buffer[0]==0x25){
-      processKeyEventG13(pressed_keys, buffer);
-      return G15_NO_ERROR;
+    	caps = g15DeviceCapabilities();
+    	if((caps & G15_DEVICE_G13) && buffer[0]==0x25){
+    		processKeyEventG13(pressed_keys, buffer);
+    		return G15_NO_ERROR;
+    	}
     }
-
-    switch(ret) {
+    switch(read) {
       case 4:
           processKeyEvent4Byte(pressed_keys, buffer);
           return G15_NO_ERROR;
@@ -1095,6 +1102,7 @@ int getPressedKeys(unsigned int *pressed_keys, unsigned int timeout)
       case 9:
           processKeyEvent9Byte(pressed_keys, buffer);
           return G15_NO_ERROR;
+      // TODO : Add case for return of 2 bytes (G510 media keys).
       default:
           return handle_usb_errors("Keyboard Read", ret); /* allow the app to deal with errors */
     }
