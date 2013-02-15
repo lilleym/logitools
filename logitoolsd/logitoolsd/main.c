@@ -50,8 +50,8 @@ unsigned int cycle_key;
 unsigned int client_handles_keys = 0;
 static unsigned int set_backlight = 0;
 struct lcd_t *keyhandler = NULL;
-static uid_t	*nobody_uid = -1;
-static gid_t	*nobody_gid = -1;
+static uid_t	nobody_uid = -1;
+static gid_t	nobody_gid = -1;
 unsigned char user[256];
 static int loaded_plugins = 0;
 

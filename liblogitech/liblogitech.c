@@ -122,7 +122,7 @@ static int initLibUsb()
 }
 
 /* Convenience function to correctly cleanup open device list. */
-static int findCleanup(libusb_device_handle *handle, libusb_device **devices) {
+static libusb_device_handle *findCleanup(libusb_device_handle *handle, libusb_device **devices) {
 	if (handle)
 		libusb_close(handle);
 	libusb_free_device_list(devices, 1);	/* De-reference entire list. */
@@ -135,8 +135,8 @@ static libusb_device_handle * findAndOpenDevice(libg15_devices_t handled_device,
 	libusb_device_handle *handle = NULL;
 	struct libusb_device_descriptor desc;
 	struct libusb_config_descriptor *cfg;
-	struct libusb_interface *interface;
-	struct libusb_interface_descriptor *if_desc;
+	const struct libusb_interface *interface;
+	const struct libusb_interface_descriptor *if_desc;
 	ssize_t count;
 	int i, j, k, l, m, ret, retries;
 	unsigned int found = 0;
@@ -172,7 +172,7 @@ static libusb_device_handle * findAndOpenDevice(libg15_devices_t handled_device,
                 			if (k == G510_STANDARD_KEYBOARD_INTERFACE)
                 				continue;	/* NOT break */
                 		}
-                		if ((g15_keys_endpoint != NULL) && (g15_lcd_endpoint != NULL)) {
+                		if ((g15_keys_endpoint != 0) && (g15_lcd_endpoint != 0)) {
                 			break;	/* We're done, so finish up. */
                 		}
                 		interface = &(cfg->interface[k]);
@@ -205,17 +205,18 @@ static libusb_device_handle * findAndOpenDevice(libg15_devices_t handled_device,
                                    	}
                                 }
                                 usleep(50*1000);
+                                g15_log(stderr, G15_LOG_INFO, "Trying to claim interface %d\n", k);
                                 while ((ret = libusb_claim_interface(handle, k)) && (retries < 10)) {
                                 	usleep(50*1000);
                                     retries++;
-                                    g15_log(stderr, G15_LOG_INFO, "Trying to claim interface\n");
+                                    g15_log(stderr, G15_LOG_INFO, "Trying to claim interface %d, retry %d\n", k, retries);
                                 }
                                 if (ret) {
                                    	g15_log(stderr, G15_LOG_INFO, "Error claiming interface, code %d\n", ret);
                                    	return	findCleanup(handle, devices);
                                 }
                                 for (m = 0; m < if_desc->bNumEndpoints; m++) {
-                                   	struct libusb_endpoint_descriptor *end = &(if_desc->endpoint[m]);
+                                   	const struct libusb_endpoint_descriptor *end = &(if_desc->endpoint[m]);
 
                                    	g15_log(stderr, G15_LOG_INFO, "Found %s endpoint %i with address 0x%X maxtransfersize=%i\n",
                                    			((0x80 & end->bEndpointAddress) ? "\"Extra Keys\"" : "\"LCD\""),
